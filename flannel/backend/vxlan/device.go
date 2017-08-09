@@ -60,7 +60,7 @@ func ensureLink(vxlan *netlink.Vxlan) (*netlink.Vxlan, error) {
 		}
 
 		// delete existing
-		log.Warningf("%q already exists with incompatable configuration: %v; recreating device", vxlan.Name, incompat)
+		log.Warningf("%q already exists with incompatible configuration: %v; recreating device", vxlan.Name, incompat)
 		if err = netlink.LinkDel(existing); err != nil {
 			return nil, fmt.Errorf("failed to delete interface: %v", err)
 		}
@@ -234,7 +234,7 @@ func setAddr4(link *netlink.Vxlan, ipn *net.IPNet) error {
 		return err
 	}
 
-	addr := netlink.Addr{ipn, ""}
+	addr := netlink.Addr{IPNet: ipn}
 	existing := false
 	for _, old := range addrs {
 		if old.IPNet.String() == addr.IPNet.String() {

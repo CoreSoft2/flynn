@@ -22,7 +22,6 @@ import (
 
 	"github.com/docker/docker/pkg/term"
 	"github.com/docker/go-units"
-	"github.com/docker/libcontainer/netlink"
 	"github.com/docker/libnetwork/ipallocator"
 	"github.com/docker/libnetwork/netutils"
 	"github.com/flynn/flynn/discoverd/client"
@@ -48,11 +47,11 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/rancher/sparse-tools/sparse"
+	"github.com/vishvananda/netlink"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
-	imageRoot         = "/var/lib/docker"
 	containerRoot     = "/var/lib/flynn/container"
 	defaultMountFlags = syscall.MS_NOEXEC | syscall.MS_NOSUID | syscall.MS_NODEV
 	defaultPartition  = "user"
@@ -82,6 +81,10 @@ func NewLibcontainerBackend(config *LibcontainerConfig) (Backend, error) {
 	}
 
 	if err := setupCGroups(config.PartitionCGroups); err != nil {
+		return nil, err
+	}
+
+	if err := forceMemoryOvercommit(); err != nil {
 		return nil, err
 	}
 
@@ -183,19 +186,6 @@ func writeContainerConfig(path string, c *containerinit.Config, envs ...map[stri
 	return json.NewEncoder(f).Encode(c)
 }
 
-func readDockerImageConfig(id string) (*dockerImageConfig, error) {
-	res := &struct{ Config dockerImageConfig }{}
-	f, err := os.Open(filepath.Join(imageRoot, "graph", id, "json"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	if err := json.NewDecoder(f).Decode(res); err != nil {
-		return nil, err
-	}
-	return &res.Config, nil
-}
-
 // ConfigureNetworking is called once during host startup and sets up the local
 // bridge and forwarding rules for containers.
 func (l *LibcontainerBackend) ConfigureNetworking(config *host.NetworkConfig) error {
@@ -207,46 +197,59 @@ func (l *LibcontainerBackend) ConfigureNetworking(config *host.NetworkConfig) er
 	}
 	l.ipalloc.RequestIP(l.bridgeNet, l.bridgeAddr)
 
-	err = netlink.CreateBridge(l.BridgeName, false)
+	la := netlink.NewLinkAttrs()
+	la.Name = l.BridgeName
+	bridge := netlink.Link(&netlink.Bridge{LinkAttrs: la})
+	err = netlink.LinkAdd(bridge)
 	bridgeExists := os.IsExist(err)
 	if err != nil && !bridgeExists {
 		return err
 	}
 
-	bridge, err := net.InterfaceByName(l.BridgeName)
+	bridge, err = netlink.LinkByName(l.BridgeName)
 	if err != nil {
 		return err
 	}
 	if !bridgeExists {
 		// We need to explicitly assign the MAC address to avoid it changing to a lower value
 		// See: https://github.com/flynn/flynn/issues/223
-		b := random.Bytes(5)
-		bridgeMAC := fmt.Sprintf("fe:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4])
-		if err := netlink.NetworkSetMacAddress(bridge, bridgeMAC); err != nil {
+		mac := random.Bytes(5)
+		if err := netlink.LinkSetHardwareAddr(bridge, append([]byte{0xfe}, mac...)); err != nil {
 			return err
 		}
 	}
-	currAddrs, err := bridge.Addrs()
+	currAddrs, err := netlink.AddrList(bridge, netlink.FAMILY_ALL)
 	if err != nil {
 		return err
 	}
 	setIP := true
 	for _, addr := range currAddrs {
-		ip, net, _ := net.ParseCIDR(addr.String())
-		if ip.Equal(l.bridgeAddr) && net.String() == l.bridgeNet.String() {
+		if addr.IPNet.IP.Equal(l.bridgeAddr) && bytes.Equal(addr.IPNet.Mask, l.bridgeNet.Mask) {
 			setIP = false
 		} else {
-			if err := netlink.NetworkLinkDelIp(bridge, ip, net); err != nil {
+			if err := netlink.AddrDel(bridge, &addr); err != nil {
 				return err
 			}
 		}
 	}
 	if setIP {
-		if err := netlink.NetworkLinkAddIp(bridge, l.bridgeAddr, l.bridgeNet); err != nil {
+		if err := netlink.AddrAdd(bridge, &netlink.Addr{IPNet: &net.IPNet{IP: l.bridgeAddr, Mask: l.bridgeNet.Mask}}); err != nil {
 			return err
 		}
 	}
-	if err := netlink.NetworkLinkUp(bridge); err != nil {
+
+	// Workaround for a kernel bug that results in a unregister_netdevice error
+	// in dmesg and hang of netlink, requiring a reboot.
+	//
+	// Remove when the kernel bug is fixed.
+	//
+	// https://github.com/moby/moby/issues/5618
+	// https://github.com/kubernetes/kubernetes/issues/20096
+	if err := netlink.SetPromiscOn(bridge); err != nil {
+		return err
+	}
+
+	if err := netlink.LinkSetUp(bridge); err != nil {
 		return err
 	}
 
@@ -397,7 +400,7 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 			return err
 		}
 	}
-	rootMount, err := l.rootOverlayMount(job)
+	rootMount, diffDir, err := l.rootOverlayMount(job)
 	if err != nil {
 		log.Error("error setting up rootfs", "err", err)
 		return err
@@ -528,12 +531,24 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		bindMount(l.InitPath, "/.containerinit", false),
 		bindMount(l.resolvConf, "/etc/resolv.conf", false),
 		bindMount(sharedDir, "/.container-shared", true),
+		bindMount(diffDir, host.DiffPath, false),
 	)
 	for _, m := range job.Config.Mounts {
 		if m.Target == "" {
 			return errors.New("host: invalid empty mount target")
 		}
-		config.Mounts = append(config.Mounts, bindMount(m.Target, m.Location, m.Writeable))
+		if m.Device == "" {
+			// assume it is a bind mount
+			config.Mounts = append(config.Mounts, bindMount(m.Target, m.Location, m.Writeable))
+			continue
+		}
+		config.Mounts = append(config.Mounts, &configs.Mount{
+			Source:      m.Target,
+			Destination: m.Location,
+			Device:      m.Device,
+			Data:        m.Data,
+			Flags:       m.Flags,
+		})
 	}
 
 	// apply volumes
@@ -679,24 +694,24 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 	return nil
 }
 
-func (l *LibcontainerBackend) rootOverlayMount(job *host.Job) (*configs.Mount, error) {
+func (l *LibcontainerBackend) rootOverlayMount(job *host.Job) (*configs.Mount, string, error) {
 	log := l.Logger.New("fn", "rootOverlayMount", "job.id", job.ID)
 	layers := make([]string, 0, len(job.Mountspecs)+1)
 	for _, spec := range job.Mountspecs {
 		if spec.Type != host.MountspecTypeSquashfs {
-			return nil, fmt.Errorf("unknown mountspec type: %q", spec.Type)
+			return nil, "", fmt.Errorf("unknown mountspec type: %q", spec.Type)
 		}
 		log.Info("mounting squashfs layer", "id", spec.ID)
 		path, err := l.mountSquashfs(spec)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		layers = append(layers, path)
 	}
 	log.Info("mounting ext2 layer")
 	tmpfs, err := l.mountTmpfs(job)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	layers = append(layers, tmpfs)
 	dirs := make([]string, len(layers))
@@ -709,7 +724,7 @@ func (l *LibcontainerBackend) rootOverlayMount(job *host.Job) (*configs.Mount, e
 	workDir := filepath.Join(tmpfs, "overlay-workdir")
 	for _, dir := range []string{upperDir, workDir} {
 		if err := os.Mkdir(dir, 0755); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 	return &configs.Mount{
@@ -717,7 +732,7 @@ func (l *LibcontainerBackend) rootOverlayMount(job *host.Job) (*configs.Mount, e
 		Destination: "/",
 		Device:      "overlay",
 		Data:        fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(dirs[1:], ":"), upperDir, workDir),
-	}, nil
+	}, upperDir, nil
 }
 
 func (l *LibcontainerBackend) mountSquashfs(m *host.Mountspec) (string, error) {
@@ -1605,4 +1620,18 @@ func createTmpfs(size int64) (*Tmpfs, error) {
 	}
 
 	return &Tmpfs{Path: f.Name(), Size: size}, nil
+}
+
+func forceMemoryOvercommit() error {
+	path := "/proc/sys/vm/overcommit_memory"
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.HasPrefix(data, []byte("1")) {
+		if err := ioutil.WriteFile(path, []byte("1"), 0640); err != nil {
+			return fmt.Errorf("error forcing overcommit: %s", err)
+		}
+	}
+	return nil
 }

@@ -67,7 +67,7 @@ type ProviderConfig struct {
 
 	Currently this only supports file-type vdevs; be aware that these are
 	convenient, but may have limited performance.  Advanced users should
-	consider configuring a zpool using block devices directly, and specifing
+	consider configuring a zpool using block devices directly, and specifying
 	use of datasets in those zpools those rather than this fallback mechanism.
 */
 type MakeDev struct {
@@ -423,8 +423,16 @@ func (p *Provider) mountDataset(vol *zfsVolume) error {
 		return fmt.Errorf("could not mount: %s", err)
 	}
 	if vol.filesystem != nil {
+		zvol := p.zvolPath(vol.info)
+		// ensure the zvol exists before trying to mount it
+		if err := zvolOpenAttempts.Run(func() error {
+			_, err := os.Stat(zvol)
+			return err
+		}); err != nil {
+			return fmt.Errorf("could not open zfs device %q: %s", zvol, err)
+		}
 		return syscall.Mount(
-			p.zvolPath(vol.info),
+			zvol,
 			vol.basemount,
 			string(vol.filesystem.Type),
 			vol.filesystem.MountFlags,

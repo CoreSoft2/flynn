@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -181,8 +182,8 @@ func debugLogWriter(t *c.C) io.Writer {
 }
 
 func (h *Helper) bootClusterWithConfig(t *c.C, conf *cluster2.BootConfig) *Cluster {
-	conf.ImagesPath = "../images.json"
-	conf.ManifestPath = "../bootstrap/bin/manifest.json"
+	conf.ImagesPath = "../build/images.json"
+	conf.ManifestPath = "../build/manifests/bootstrap-manifest.json"
 	conf.Client = h.controllerClient(t)
 
 	conf.Logger = log15.New()
@@ -434,6 +435,24 @@ func (h *Helper) createAppWithClient(t *c.C, client controller.Client) (*ct.App,
 					},
 				}},
 			},
+			"minio": {
+				Args: []string{"/bin/minio", "server", "/data"},
+				Env: map[string]string{
+					"MINIO_ACCESS_KEY": minioAccessKey,
+					"MINIO_SECRET_KEY": minioSecretKey,
+				},
+				Ports: []ct.Port{{
+					Proto: "tcp",
+					Port:  9000,
+					Service: &host.Service{
+						Name:   "minio",
+						Create: true,
+						Check:  &host.HealthCheck{Type: "http", Status: 403},
+					},
+				}},
+				Service: "minio",
+				Volumes: []ct.VolumeReq{{Path: "/data"}},
+			},
 		},
 	}
 	t.Assert(client.CreateRelease(app.ID, release), c.IsNil)
@@ -446,15 +465,12 @@ func (h *Helper) createArtifact(t *c.C, name string) *ct.Artifact {
 }
 
 func (h *Helper) createArtifactWithClient(t *c.C, name string, client controller.Client) *ct.Artifact {
-	path := fmt.Sprintf("../image/%s.json", name)
-	manifest, err := ioutil.ReadFile(path)
+	f, err := os.Open(fmt.Sprintf("../build/image/%s.json", name))
 	t.Assert(err, c.IsNil)
-	artifact := &ct.Artifact{
-		Type:             ct.ArtifactTypeFlynn,
-		URI:              fmt.Sprintf("https://example.com?target=/images/%s.json", name),
-		RawManifest:      manifest,
-		LayerURLTemplate: "file:///var/lib/flynn/layer-cache/{id}.squashfs",
-	}
+	defer f.Close()
+	artifact := &ct.Artifact{}
+	t.Assert(json.NewDecoder(f).Decode(artifact), c.IsNil)
+	artifact.URI = "http://127.0.0.1/" + random.UUID()
 	t.Assert(client.CreateArtifact(artifact), c.IsNil)
 	return artifact
 }
@@ -540,8 +556,17 @@ func (h *Helper) assertURI(t *c.C, uri string, status int) {
 
 func (h *Helper) buildDockerImage(t *c.C, repo string, lines ...string) {
 	cmd := exec.Command("docker", "build", "--tag", repo, "-")
-	cmd.Stdin = bytes.NewReader([]byte(fmt.Sprintf("FROM flynn/test-apps\n%s\n", strings.Join(lines, "\n"))))
+	cmd.Stdin = bytes.NewReader([]byte(fmt.Sprintf("FROM busybox\n%s\n", strings.Join(lines, "\n"))))
 	t.Assert(run(t, cmd), Succeeds)
+}
+
+func (h *Helper) buildHTTPDockerImage(t *c.C, repo string, lines ...string) {
+	h.buildDockerImage(t, repo, append(lines,
+		`RUN echo -e '#!/bin/sh\necho -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"' > /http.sh`,
+		`RUN chmod +x /http.sh`,
+		`RUN echo 'exec nc -ll -p $PORT -e /http.sh' > /server.sh`,
+		`CMD ["sh", "/server.sh"]`,
+	)...)
 }
 
 func (h *Helper) testBuildCaching(t *c.C, x *Cluster) {
